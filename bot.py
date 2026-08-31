@@ -3,6 +3,9 @@
 import logging
 import os
 import re
+import sqlite3
+from pathlib import Path
+from typing import Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -23,6 +26,48 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다.")
 
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/accounts.db"))
+
+
+def initialize_database() -> None:
+    """Create the account table when the bot starts for the first time."""
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                user_id TEXT PRIMARY KEY,
+                bank TEXT NOT NULL,
+                account TEXT NOT NULL
+            )
+            """
+        )
+
+
+def save_account(user_id: int, bank: str, account: str) -> None:
+    """Create or update the bank account registered by a Discord user."""
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO accounts (user_id, bank, account)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                bank = excluded.bank,
+                account = excluded.account
+            """,
+            (str(user_id), bank, account),
+        )
+
+
+def get_account(user_id: int) -> Optional[Tuple[str, str]]:
+    """Return a user's registered bank and account number, if available."""
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        row = connection.execute(
+            "SELECT bank, account FROM accounts WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+    return (str(row[0]), str(row[1])) if row is not None else None
+
 
 class TristanaBot(discord.Client):
     """Discord client that owns the application command tree."""
@@ -33,6 +78,7 @@ class TristanaBot(discord.Client):
 
     async def setup_hook(self) -> None:
         """Register slash commands with Discord when the bot starts."""
+        initialize_database()
         # Keep the button working for settlement messages created before a
         # restart. The button has a stable custom_id and the view never times out.
         self.add_view(SettlementView())
@@ -121,38 +167,109 @@ class SettlementView(discord.ui.View):
         )
 
 
+def create_help_embed() -> discord.Embed:
+    """Build the shared usage guide shown by the help commands."""
+    embed = discord.Embed(
+        title="Tristana 봇 사용법",
+        description="정산을 시작하기 전에 본인 계좌를 먼저 등록해주세요.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="1. 계좌 등록",
+        value=(
+            "`/계좌등록 은행:국민은행 계좌번호:123-456-789`\n"
+            "등록 정보는 본인만 사용할 수 있으며, 다시 등록하면 갱신됩니다."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="2. 정산 시작",
+        value=(
+            "`/정산 total_amount:10000 user_mentions:@유저1 @유저2`\n"
+            "명령어 사용자를 포함해 균등 정산하고, 멘션한 유저에게 입금 계좌를 DM으로 보냅니다."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="3. 정산 완료",
+        value="입금 후 정산 메시지의 **정산 완료** 버튼을 눌러주세요.",
+        inline=False,
+    )
+    embed.add_field(
+        name="제작자 정보",
+        value="제작자: **sharon77770**\n연락처: Instagram",
+        inline=False,
+    )
+    return embed
+
+
 @bot.tree.command(name="help", description="봇 사용 안내")
 async def help_command(interaction: discord.Interaction) -> None:
-    """Respond to /help with a greeting."""
-    await interaction.response.send_message("안녕하세요")
+    """Show the bot usage guide through the English command alias."""
+    await interaction.response.send_message(embed=create_help_embed(), ephemeral=True)
+
+
+@bot.tree.command(name="도움", description="봇 사용 방법을 안내합니다.")
+async def help_korean_command(interaction: discord.Interaction) -> None:
+    """Show the bot usage guide."""
+    await interaction.response.send_message(embed=create_help_embed(), ephemeral=True)
+
+
+@bot.tree.command(name="계좌등록", description="정산에 사용할 본인 계좌를 등록합니다.")
+@app_commands.describe(
+    은행="은행명 (예: 국민은행)",
+    계좌번호="계좌번호 (예: 123-456-789)",
+)
+async def register_account_command(
+    interaction: discord.Interaction,
+    은행: str,
+    계좌번호: str,
+) -> None:
+    """Register or update the calling user's settlement account."""
+    bank = 은행.strip()
+    account = 계좌번호.strip()
+    if not bank or not account:
+        await interaction.response.send_message(
+            "은행과 계좌번호를 모두 입력해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if len(bank) > 100 or len(account) > 256:
+        await interaction.response.send_message(
+            "은행명은 100자, 계좌번호는 256자 이내로 입력해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    save_account(interaction.user.id, bank, account)
+    await interaction.response.send_message(
+        "정산용 계좌가 등록되었습니다. 다시 등록하면 기존 계좌 정보가 갱신됩니다.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="정산", description="총 금액을 참여자와 균등하게 정산합니다.")
 @app_commands.describe(
     total_amount="정산할 총 금액(원)",
     user_mentions="정산할 유저 멘션 목록 (예: @유저1 @유저2)",
-    account_info="입금 계좌 정보 (예: 국민은행 123-456-789)",
 )
 async def settle_command(
     interaction: discord.Interaction,
     total_amount: app_commands.Range[int, 1],
     user_mentions: str,
-    account_info: str,
 ) -> None:
     """Split a total amount between mentioned users and the command author."""
-    if not account_info.strip():
+    registered_account = get_account(interaction.user.id)
+    if registered_account is None:
         await interaction.response.send_message(
-            "입금 계좌 정보를 입력해주세요. (예: 국민은행 123-456-789)",
+            "정산을 시작하려면 먼저 `/계좌등록`으로 은행과 계좌번호를 등록해주세요.",
             ephemeral=True,
         )
         return
 
-    if len(account_info) > 1024:
-        await interaction.response.send_message(
-            "입금 계좌 정보는 1,024자 이내로 입력해주세요.",
-            ephemeral=True,
-        )
-        return
+    bank, account = registered_account
+    account_info = f"{bank} {account}"
 
     mentioned_ids = USER_MENTION_PATTERN.findall(user_mentions)
     if not mentioned_ids:

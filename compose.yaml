@@ -4,3 +4,8 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    volumes:
+      - discord-bot-data:/app/data
+
+volumes:
+  discord-bot-data:
